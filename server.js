@@ -201,6 +201,55 @@ app.post("/api/research-signal", async (req, res) => {
       });
     }
   });
+
+  app.post("/api/prospects", async (req, res) => {
+    try {
+      const { companyDomain, titles } = req.body;
+  
+      if (!companyDomain) {
+        return res.status(400).json({ error: "companyDomain is required" });
+      }
+  
+      const apolloRes = await fetch(
+        "https://api.apollo.io/api/v1/mixed_people/api_search",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+          },
+          body: JSON.stringify({
+            api_key: process.env.APOLLO_API_KEY,
+            q_organization_domains: [companyDomain],
+            person_titles: titles || ["Marketing", "Growth", "Partnerships"],
+            page: 1,
+            per_page: 5,
+          }),
+        }
+      );
+  
+      const data = await apolloRes.json();
+  
+      const people =
+        data.people?.map((p) => ({
+          name: `${p.first_name || ""} ${p.last_name || ""}`,
+          title: p.title,
+          linkedin: p.linkedin_url,
+          company: p.organization?.name,
+        })) || [];
+  
+      res.json({
+        companyDomain,
+        prospects: people,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({
+        error: "Something went wrong",
+        details: error.message,
+      });
+    }
+  });
   
 app.listen(process.env.PORT || 3000, () => {
   console.log(`Server running on port ${process.env.PORT || 3000}`);
