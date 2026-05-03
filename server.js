@@ -8,6 +8,35 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+/** Parse JSON from a fetch Response; throw if HTTP status indicates failure. */
+async function readJsonResponse(response, serviceName) {
+  let data = {};
+  try {
+    data = await response.json();
+  } catch {
+    // ignore non-JSON bodies
+  }
+  if (!response.ok) {
+    const msg =
+      data.error?.message ||
+      data.message ||
+      (typeof data.error === "string" ? data.error : null) ||
+      `${serviceName} request failed (${response.status})`;
+    const err = new Error(msg);
+    err.status = response.status;
+    err.upstream = data;
+    throw err;
+  }
+  return data;
+}
+
+function httpStatusFromUpstreamError(error) {
+  const s = Number(error.status);
+  if (s === 429) return 429;
+  if (s >= 500) return 502;
+  return 500;
+}
+
 app.post("/api/signals", async (req, res) => {
   try {
     const { url } = req.body;
@@ -29,12 +58,11 @@ app.post("/api/signals", async (req, res) => {
       }),
     });
 
-    const scrapeData = await scrapeRes.json();
+    const scrapeData = await readJsonResponse(scrapeRes, "Firecrawl");
 
     if (!scrapeData?.data?.markdown) {
-      return res.status(500).json({
+      return res.status(502).json({
         error: "No markdown returned from Firecrawl",
-        details: scrapeData,
       });
     }
 
@@ -63,28 +91,117 @@ app.post("/api/signals", async (req, res) => {
       }),
     });
 
-    const aiData = await aiRes.json();
+    const aiData = await readJsonResponse(aiRes, "OpenAI");
 
-    let output = aiData.choices[0].message.content;
+    let output = aiData.choices?.[0]?.message?.content;
+    if (typeof output !== "string" || !output.trim()) {
+      return res.status(502).json({ error: "No completion from OpenAI" });
+    }
 
     output = output
-    .replace(/```json/g, "")
-    .replace(/```/g, "")
-    .trim();
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
 
-    res.json({
-    url,
-    result: JSON.parse(output),
-    });
+    let result;
+    try {
+      result = JSON.parse(output);
+    } catch {
+      return res.status(422).json({
+        error: "Model returned invalid JSON",
+        raw: output.slice(0, 500),
+      });
+    }
+
+    res.json({ url, result });
   } catch (error) {
     console.error(error);
-    res.status(500).json({
+    res.status(httpStatusFromUpstreamError(error)).json({
       error: "Something went wrong",
       details: error.message,
     });
   }
 });
 
+app.post("/api/research-signal", async (req, res) => {
+    try {
+      const { company } = req.body;
+  
+      if (!company) {
+        return res.status(400).json({ error: "Company is required" });
+      }
+  
+      const perplexityRes = await fetch("https://api.perplexity.ai/v1/sonar", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.PERPLEXITY_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "sonar",
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a B2B GTM research assistant. Analyse recent company activity and return structured insights for sales teams. Only return valid JSON.",
+            },
+            {
+              role: "user",
+              content: `
+  Find recent news, signals and GTM opportunities for: ${company}.
+  
+  Return JSON with:
+  {
+    "company": "",
+    "recent_news": [],
+    "business_signals": [],
+    "hiring_or_expansion": "",
+    "product_or_partnerships": "",
+    "possible_pain_points": [],
+    "gtm_opportunity": "",
+    "outreach_angles": [],
+    "suggested_buyer_personas": [],
+    "sources": []
+  }
+              `,
+            },
+          ],
+        }),
+      });
+  
+      const data = await readJsonResponse(perplexityRes, "Perplexity");
+
+      let output = data.choices?.[0]?.message?.content;
+      if (typeof output !== "string" || !output.trim()) {
+        return res.status(502).json({ error: "No completion from Perplexity" });
+      }
+
+      output = output
+        .replace(/```json/g, "")
+        .replace(/```/g, "")
+        .trim();
+  
+      let parsed;
+  
+      try {
+        parsed = JSON.parse(output);
+      } catch {
+        parsed = { raw: output };
+      }
+  
+      res.json({
+        company,
+        result: parsed,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(httpStatusFromUpstreamError(error)).json({
+        error: "Something went wrong",
+        details: error.message,
+      });
+    }
+  });
+  
 app.listen(process.env.PORT || 3000, () => {
   console.log(`Server running on port ${process.env.PORT || 3000}`);
 });
